@@ -13,40 +13,59 @@ export async function simpleOnionRouter(nodeId: number) {
   let lastReceivedDecryptedMessage: string | null = null;
   let lastMessageDestination: number | null = null;
 
-  // ✅ Generate an actual RSA key pair
+  // ✅ Generate a unique RSA key pair for this node
   const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
     modulusLength: 2048,
     publicKeyEncoding: { type: "spki", format: "pem" },
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
   });
 
-  // Store the private key securely in memory
-  const privateKeyBase64 = Buffer.from(privateKey).toString("base64");
-
   // ✅ Register node with the registry AFTER server starts
-  async function registerNode() {
-    try {
-      await axios.post(`http://localhost:${REGISTRY_PORT}/registerNode`, {
-        nodeId,
-        pubKey: publicKey, // ✅ Use the actual public key
-      });
-      console.log(`✅ Node ${nodeId} registered successfully.`);
-    } catch (error) {
-      console.error(`❌ Failed to register node ${nodeId}:`, error);
-    }
+  // In simpleOnionRouter.ts
+
+// Modify the registerNode function to strip PEM headers
+async function registerNode() {
+  try {
+    // Extract the base64 part of the public key (remove headers and footers)
+    const pubKeyBase64 = publicKey
+      .replace('-----BEGIN PUBLIC KEY-----\n', '')
+      .replace('-----END PUBLIC KEY-----\n', '')
+      .replace(/\n/g, '');
+    
+    await axios.post(`http://localhost:${REGISTRY_PORT}/registerNode`, {
+      nodeId,
+      pubKey: pubKeyBase64, // Send only the base64 part
+    });
+    console.log(`✅ Node ${nodeId} registered successfully.`);
+  } catch (error: any) {
+    console.error(`❌ Failed to register node ${nodeId}:`, error.response?.data || error.message);
   }
+}
 
-  // ✅ Implement the required /getPrivateKey route
-  onionRouter.get("/getPrivateKey", (req, res) => {
+// Ensure proper handling of the private key route
+onionRouter.get("/getPrivateKey", (req, res) => {
+  try {
+    // Extract just the base64 portion of the private key, removing headers and footers
+    const privateKeyBase64 = privateKey
+      .replace(/-----BEGIN PRIVATE KEY-----|\n|-----END PRIVATE KEY-----/g, '')
+      .trim();
+    
+    // Make sure to set the content type to JSON
+    res.setHeader('Content-Type', 'application/json');
+    
+    // Return the result in the expected format
     res.json({ result: privateKeyBase64 });
-  });
-
+  } catch (error) {
+    console.error(`❌ Error retrieving private key:`, error);
+    res.status(500).json({ error: "Failed to get private key" });
+  }
+});
   // ✅ Implement the status route
   onionRouter.get("/status", (req, res) => {
     res.send("live");
   });
 
-  // ✅ Implement GET routes for node message tracking
+  // ✅ Implement GET routes for message tracking
   onionRouter.get("/getLastReceivedEncryptedMessage", (req, res) => {
     res.json({ result: lastReceivedEncryptedMessage });
   });
@@ -59,43 +78,52 @@ export async function simpleOnionRouter(nodeId: number) {
     res.json({ result: lastMessageDestination });
   });
 
-  // Start the server and register the node after it's running
-  const server = onionRouter.listen(BASE_ONION_ROUTER_PORT + nodeId, () => {
-    console.log(`🚀 Onion router ${nodeId} is running on port ${BASE_ONION_ROUTER_PORT + nodeId}`);
-    registerNode(); // ✅ Register after the server is running
-  });
-
+  // ✅ Implement message processing route
   onionRouter.post("/message", async (req, res) => {
     try {
       const { message } = req.body;
-      const privateKey = crypto.createPrivateKey(privateKeyBase64);
-      
+      lastReceivedEncryptedMessage = message;
+
+      // Extract encrypted symmetric key & encrypted message
       const encryptedKey = Buffer.from(message.slice(0, 344), "base64");
       const encryptedLayer = message.slice(344);
-      
-      const symmetricKey = crypto.privateDecrypt({
-        key: privateKey,
-        padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-      }, encryptedKey);
-      
+
+      // ✅ Correctly decrypt symmetric key using private key
+      const symmetricKey = crypto.privateDecrypt(
+        {
+          key: privateKey, // ✅ Use PEM private key directly
+          padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+        },
+        encryptedKey
+      );
+
+      // ✅ Decrypt the message layer
       const decipher = crypto.createDecipheriv("aes-256-cbc", symmetricKey, Buffer.alloc(16, 0));
       let decrypted = decipher.update(encryptedLayer, "base64", "utf8");
       decrypted += decipher.final("utf8");
-      
+
+      // Extract next destination & remaining message
       const nextDestination = parseInt(decrypted.slice(0, 10), 10);
-      const decryptedMessage = decrypted.slice(10);
-      
-      if (nextDestination >= 5000) {
-        await axios.post(`http://localhost:${nextDestination}/message`, { message: decryptedMessage });
-      } else {
-        lastReceivedDecryptedMessage = decryptedMessage;
+      lastMessageDestination = nextDestination;
+      lastReceivedDecryptedMessage = decrypted.slice(10);
+
+      // Forward message if not final destination
+      if (nextDestination >= BASE_ONION_ROUTER_PORT) {
+        await axios.post(`http://localhost:${nextDestination}/message`, { message: lastReceivedDecryptedMessage });
       }
+
       res.sendStatus(200);
-    } catch (error) {
-      console.error("Failed to process message:", error);
+    } catch (error: any) {
+      console.error("❌ Failed to process message:", error.message);
       res.status(500).json({ error: "Message processing failed" });
     }
   });
-  
+
+  // ✅ Start the server and register node
+  const server = onionRouter.listen(BASE_ONION_ROUTER_PORT + nodeId, async () => {
+    console.log(`🚀 Onion Router ${nodeId} running on port ${BASE_ONION_ROUTER_PORT + nodeId}`);
+    await registerNode(); // Register node AFTER startup
+  });
+
   return server;
 }
